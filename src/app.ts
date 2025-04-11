@@ -101,7 +101,7 @@ const initializeBot = async (): Promise<any> => {
         }
 
         // Configurar servidor HTTP para endpoint de API
-        provider.initHttpServer(3002);
+        provider.initHttpServer(3003);
 
         // Verificar que el servidor HTTP existe
         if (provider.http?.server) {
