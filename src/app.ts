@@ -3,7 +3,7 @@ import { BaileysProvider, handleCtx } from "@bot-whatsapp/provider-baileys";
 import fs from 'fs';
 
 // Flujo básico de bienvenida
-const flowBienvenida = addKeyword('hola').addAnswer('Hola!! bienvenido');
+//const flowBienvenida = addKeyword('hola').addAnswer('Hola!! bienvenido');
 
 // Configurar registro de logs
 const logMessage = (message: string): void => {
@@ -182,7 +182,7 @@ const initializeBot = async (): Promise<any> => {
 
         // Crear la instancia del bot
         const botInstance = await createBot({
-            flow: createFlow([flowBienvenida]),
+            flow: createFlow([]),
             database: new MemoryDB(),
             provider
         });
