@@ -2,9 +2,6 @@ import { createBot, createFlow, MemoryDB, createProvider, addKeyword } from '@bo
 import { BaileysProvider, handleCtx } from "@bot-whatsapp/provider-baileys";
 import fs from 'fs';
 
-// Flujo básico de bienvenida
-//const flowBienvenida = addKeyword('hola').addAnswer('Hola!! bienvenido');
-
 // Configurar registro de logs
 const logMessage = (message: string): void => {
     const timestamp = new Date().toISOString();
@@ -18,7 +15,13 @@ const logMessage = (message: string): void => {
 interface ConnectionState {
     isConnected: boolean;
     reconnectAttempts: number;
-    pingInterval: NodeJS.Timeout | null; // Modificado para aceptar tanto Timeout como null
+    pingInterval: NodeJS.Timeout | null;
+}
+
+interface FailedNumber {
+    number: string;
+    lastAttempt: Date;
+    attempts: number;
 }
 
 // Estado de la conexión
@@ -30,6 +33,10 @@ const state: ConnectionState = {
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_INTERVAL = 30000; // 30 segundos
+const MAX_ATTEMPTS_PER_NUMBER = 3;
+const RETRY_DELAY_MINUTES = 60; // 1 hora antes de reintentar
+
+let failedNumbers: FailedNumber[] = [];
 
 // Función para limpiar intervalos
 const clearIntervals = (): void => {
@@ -39,17 +46,49 @@ const clearIntervals = (): void => {
     }
 };
 
+// Función para verificar si un número puede ser reintentado
+const canRetryNumber = (number: string): boolean => {
+    const failed = failedNumbers.find(f => f.number === number);
+    if (!failed) return true;
+    
+    const now = new Date();
+    const timeDiff = (now.getTime() - failed.lastAttempt.getTime()) / (1000 * 60);
+    
+    return failed.attempts < MAX_ATTEMPTS_PER_NUMBER || 
+           timeDiff > RETRY_DELAY_MINUTES;
+};
+
+// Función para registrar un fallo
+const registerFailedNumber = (number: string): void => {
+    const existingIndex = failedNumbers.findIndex(f => f.number === number);
+    
+    if (existingIndex >= 0) {
+        failedNumbers[existingIndex].attempts++;
+        failedNumbers[existingIndex].lastAttempt = new Date();
+    } else {
+        failedNumbers.push({
+            number,
+            attempts: 1,
+            lastAttempt: new Date()
+        });
+    }
+    
+    // Limpiar números antiguos
+    const now = new Date();
+    failedNumbers = failedNumbers.filter(f => {
+        const timeDiff = (now.getTime() - f.lastAttempt.getTime()) / (1000 * 60);
+        return timeDiff <= RETRY_DELAY_MINUTES * 2;
+    });
+};
+
 // Inicializar bot con manejo de reconexión
 const initializeBot = async (): Promise<any> => {
     try {
         logMessage("Inicializando bot de WhatsApp...");
         
-        // Crear el proveedor sin opciones personalizadas para evitar errores de TypeScript
         const provider = createProvider(BaileysProvider);
         
-        // Acceder al evento de conexión de manera segura
         if (provider.vendor && provider.vendor.ev) {
-            // Usar anotación de tipo para evitar errores de TypeScript
             const vendorEvents = provider.vendor.ev as any;
             
             vendorEvents.on('connection.update', (update: any) => {
@@ -60,7 +99,6 @@ const initializeBot = async (): Promise<any> => {
                     state.reconnectAttempts = 0;
                     logMessage("¡Bot conectado correctamente!");
                     
-                    // Iniciar verificación periódica
                     clearIntervals();
                     state.pingInterval = setInterval(() => {
                         if (state.isConnected) {
@@ -69,7 +107,6 @@ const initializeBot = async (): Promise<any> => {
                             logMessage("Verificación periódica: Bot desconectado");
                             clearIntervals();
                             
-                            // Intentar reconectar automáticamente
                             if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                                 state.reconnectAttempts++;
                                 logMessage(`Intentando reconectar (intento ${state.reconnectAttempts})...`);
@@ -86,7 +123,6 @@ const initializeBot = async (): Promise<any> => {
                     
                     clearIntervals();
                     
-                    // Manejar reconexión
                     if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                         state.reconnectAttempts++;
                         const delay = RECONNECT_INTERVAL * state.reconnectAttempts;
@@ -101,9 +137,8 @@ const initializeBot = async (): Promise<any> => {
         }
 
         // Configurar servidor HTTP para endpoint de API
-        provider.initHttpServer(3003);
+        provider.initHttpServer(3002);
 
-        // Verificar que el servidor HTTP existe
         if (provider.http?.server) {
             // Endpoint de verificación de salud
             provider.http.server.get('/health', (req, res) => {
@@ -112,19 +147,22 @@ const initializeBot = async (): Promise<any> => {
                     status: state.isConnected ? 'conectado' : 'desconectado',
                     uptime: process.uptime(),
                     reconnectAttempts: state.reconnectAttempts,
-                    timestamp: new Date().toISOString()
+                    timestamp: new Date().toISOString(),
+                    failedNumbers: failedNumbers.map(f => ({
+                        number: f.number,
+                        attempts: f.attempts,
+                        lastAttempt: f.lastAttempt.toISOString()
+                    }))
                 }));
             });
 
             // Endpoint para reinicio manual
             provider.http.server.get('/restart', (req, res) => {
-                // Reiniciar el bot
                 logMessage("Reiniciando el bot manualmente...");
                 clearIntervals();
                 state.reconnectAttempts = 0;
                 state.isConnected = false;
                 
-                // Reiniciar con un ligero retraso
                 setTimeout(() => {
                     initializeBot().then(() => {
                         logMessage("Bot reiniciado correctamente");
@@ -140,40 +178,75 @@ const initializeBot = async (): Promise<any> => {
                 }));
             });
 
-            // Endpoint para envío de mensajes
+            // Endpoint mejorado para envío de mensajes
             provider.http.server.post('/send-message', handleCtx(async (bot, req, res) => {
                 try {
                     const body = req.body;
-                    
                     const message = body.message;
                     const mediaUrl = body.mediaUrl;
-                    const number = body.number;
-
-                    if (!number) {
-                        throw new Error('El número de teléfono es obligatorio');
+                    const numbers = Array.isArray(body.number) ? body.number : [body.number];
+                    
+                    if (!numbers || numbers.length === 0) {
+                        throw new Error('Se requiere al menos un número de teléfono');
                     }
 
-                    logMessage(`Enviando mensaje a ${number}`);
+                    const successfulNumbers: string[] = [];
+                    const failedNumbersResponse: {number: string, error: string}[] = [];
                     
-                    const response = await bot.sendMessage(number, message, {
-                        media: mediaUrl
-                    });
-                    
-                    logMessage(`Mensaje enviado correctamente a ${number}`);
-                    
+                    for (const number of numbers) {
+                        if (!canRetryNumber(number)) {
+                            logMessage(`Saltando número ${number} - demasiados intentos fallidos`);
+                            failedNumbersResponse.push({
+                                number,
+                                error: 'Demasiados intentos fallidos, reintentar más tarde'
+                            });
+                            continue;
+                        }
+                        
+                        try {
+                            logMessage(`Intentando enviar mensaje a ${number}`);
+                            
+                            const response = await bot.sendMessage(number, message, {
+                                media: mediaUrl
+                            });
+                            
+                            logMessage(`Mensaje enviado correctamente a ${number}`);
+                            successfulNumbers.push(number);
+                            
+                            // Limpiar de la lista de fallidos si estaba allí
+                            failedNumbers = failedNumbers.filter(f => f.number !== number);
+                            
+                        } catch (error) {
+                            const errorMessage = error instanceof Error ? error.message : String(error);
+                            logMessage(`Error al enviar mensaje a ${number}: ${errorMessage}`);
+                            
+                            registerFailedNumber(number);
+                            failedNumbersResponse.push({
+                                number,
+                                error: errorMessage
+                            });
+                            
+                            continue;
+                        }
+                    }
+                
                     res.writeHead(200, { "Content-Type": "application/json" });
                     res.end(JSON.stringify({
-                        success: true,
-                        message: 'Mensaje enviado correctamente',
-                        response
+                        success: successfulNumbers.length > 0,
+                        successful: successfulNumbers,
+                        failed: failedNumbersResponse,
+                        message: successfulNumbers.length > 0 ? 
+                               `Mensajes enviados a ${successfulNumbers.length} de ${numbers.length} números` :
+                               'No se pudo enviar a ningún número'
                     }));
+                    
                 } catch (error) {
                     const errorMessage = error instanceof Error ? error.message : String(error);
-                    logMessage(`Error al enviar mensaje: ${errorMessage}`);
+                    logMessage(`Error en el endpoint de envío: ${errorMessage}`);
                     res.writeHead(500, { "Content-Type": "application/json" });
                     res.end(JSON.stringify({
                         success: false,
-                        message: 'Error al enviar mensaje',
+                        message: 'Error al procesar la solicitud',
                         error: errorMessage
                     }));
                 }
@@ -192,7 +265,6 @@ const initializeBot = async (): Promise<any> => {
         const errorMessage = error instanceof Error ? error.message : String(error);
         logMessage(`Error crítico al inicializar el bot: ${errorMessage}`);
         
-        // Si la inicialización falla, intentar de nuevo después de un retraso
         if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
             state.reconnectAttempts++;
             const delay = RECONNECT_INTERVAL * state.reconnectAttempts;
@@ -211,7 +283,6 @@ process.on('unhandledRejection', (error: unknown) => {
 
 process.on('uncaughtException', (error: Error) => {
     logMessage(`Excepción no capturada: ${error.message}`);
-    // No cerramos el proceso, dejamos que PM2 lo maneje
 });
 
 // Iniciar el bot
